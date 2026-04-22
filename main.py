@@ -3,13 +3,16 @@ import csv
 import json
 import logging
 import re
+import sys
 import time
 from datetime import datetime
+from html import unescape
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 # web url: https://newthink.lenovo.com.cn/deviceGuarantee.html?selname=AAAAAAAAA
+PCSUPPORT_API_BASE = "https://pcsupport.lenovo.com/us/en/api/v4"
 WARRANTY_API_BASE = "https://newthink.lenovo.com.cn/api/ThinkHome/Machine/WarrantyListInfo"
 MACHINE_API_BASE = "https://newthink.lenovo.com.cn/api/ThinkHome/Machine/MachineListInfo"
 CONFIG_API_BASE = "https://newthink.lenovo.com.cn/api/ThinkHome/Machine/ConfigListInfo"
@@ -17,6 +20,18 @@ API_TIMEOUT_SECONDS = 20
 API_MAX_RETRIES = 2
 API_RETRY_BACKOFF_SECONDS = 1
 RETRYABLE_HTTP_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
+NOT_FOUND_MESSAGE_PATTERNS = (
+    "not found",
+    "no information was found",
+    "no information found",
+    "no warranty",
+    "not exist",
+    "没有保修",
+    "无保修",
+    "不存在",
+    "未找到",
+    "没有信息",
+)
 NA_VALUE = 'N/A'
 QUERY_STATUS_OK = 'OK'
 QUERY_STATUS_PARTIAL = 'PARTIAL'
@@ -82,6 +97,44 @@ def fetch_json(url, params=None, timeout=API_TIMEOUT_SECONDS, retries=API_MAX_RE
             time.sleep(wait_seconds)
 
 
+def fetch_json_request(request, timeout=API_TIMEOUT_SECONDS, retries=API_MAX_RETRIES):
+    """Fetch JSON from a prepared urllib Request with retry for transient failures."""
+    for attempt in range(retries + 1):
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                payload = response.read().decode("utf-8")
+            return json.loads(payload)
+        except HTTPError as e:
+            if e.code not in RETRYABLE_HTTP_STATUS_CODES or attempt == retries:
+                raise
+            wait_seconds = API_RETRY_BACKOFF_SECONDS * (2 ** attempt)
+            logging.info(
+                f"Transient Lenovo API HTTP {e.code} for {request.full_url}; retrying in "
+                f"{wait_seconds}s ({attempt + 1}/{retries})"
+            )
+            time.sleep(wait_seconds)
+        except (URLError, TimeoutError, OSError, json.JSONDecodeError) as e:
+            if attempt == retries:
+                raise
+            wait_seconds = API_RETRY_BACKOFF_SECONDS * (2 ** attempt)
+            logging.info(
+                f"Transient Lenovo API error for {request.full_url}: {e}; retrying in "
+                f"{wait_seconds}s ({attempt + 1}/{retries})"
+            )
+            time.sleep(wait_seconds)
+
+
+def configure_logging():
+    """Enable clean real-time logging when the script is run from the terminal."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+        handlers=[logging.StreamHandler(sys.stdout)],
+        force=True,
+    )
+
+
 def get_warranty(sn):
     """Note: Lenovo API might not available from time to time"""
     return fetch_json(WARRANTY_API_BASE, params={"sn": sn})
@@ -95,6 +148,39 @@ def get_machine_info(sn):
 def get_config_info(sn):
     """Fetch device configuration details such as CPU and storage."""
     return fetch_json(CONFIG_API_BASE, params={"sn": sn})
+
+
+def get_pcsupport_products(sn):
+    """Resolve a serial number on Lenovo PC Support."""
+    request = Request(
+        f"{PCSUPPORT_API_BASE}/mse/getproducts?{urlencode({'productId': sn})}",
+        headers={
+            "referer": "https://pcsupport.lenovo.com/us/en/warranty-lookup",
+            "x-requested-with": "XMLHttpRequest",
+        },
+    )
+    return fetch_json_request(request)
+
+
+def get_pcsupport_ibase_info(sn, machine_type, country="us", language="en"):
+    """Fetch warranty and specification data from Lenovo PC Support."""
+    payload = json.dumps({
+        "serialNumber": sn,
+        "machineType": machine_type,
+        "country": country,
+        "language": language,
+    }).encode("utf-8")
+    request = Request(
+        f"{PCSUPPORT_API_BASE}/upsell/redport/getIbaseInfo",
+        data=payload,
+        headers={
+            "content-type": "application/json",
+            "origin": "https://pcsupport.lenovo.com",
+            "referer": "https://pcsupport.lenovo.com/us/en/warranty-lookup",
+            "x-requested-with": "XMLHttpRequest",
+        },
+    )
+    return fetch_json_request(request)
 
 
 def get_config_value(config_info, field_name):
@@ -118,6 +204,19 @@ def append_issue(existing_issue, new_issue):
     if new_issue in existing_parts:
         return existing_issue
     return f"{existing_issue}; {new_issue}"
+
+
+def merge_record_values(data, values):
+    """Fill output fields only when they are currently missing."""
+    for key, value in values.items():
+        if value and not data.get(key):
+            data[key] = value
+
+
+def message_indicates_not_found(message):
+    """Return True when an API message clearly indicates no matching data exists."""
+    normalized_message = (message or "").strip().lower()
+    return any(pattern in normalized_message for pattern in NOT_FOUND_MESSAGE_PATTERNS)
 
 
 def normalize_serial_number(sn):
@@ -174,6 +273,65 @@ def to_csv_value(value):
     return value if value else NA_VALUE
 
 
+def assess_group_fields(data, field_names, label):
+    """Return a generic result state/message for a group of output fields."""
+    has_all = all(data.get(field) for field in field_names)
+    has_any = any(data.get(field) for field in field_names)
+    if has_all:
+        return 'success', None
+    if has_any:
+        return 'partial', f"{label} data incomplete"
+    return 'not_found', f"{label} data not found"
+
+
+def strip_html(value):
+    """Convert a small HTML fragment into readable plain text."""
+    if not value:
+        return ""
+    text = re.sub(r"(?i)<br\s*/?>", " / ", value)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = unescape(text)
+    return " ".join(text.split()).strip()
+
+
+def parse_specification_table(specification_html):
+    """Parse Lenovo PC Support specification HTML into a dict of row label -> value."""
+    specs = {}
+    if not specification_html:
+        return specs
+
+    rows = re.findall(r"<tr\b[^>]*>(.*?)</tr>", specification_html, flags=re.IGNORECASE | re.DOTALL)
+    for row in rows:
+        cells = re.findall(r"<td\b[^>]*>(.*?)</td>", row, flags=re.IGNORECASE | re.DOTALL)
+        if len(cells) < 2:
+            continue
+        label = strip_html(cells[0]).lower()
+        values = [strip_html(cell) for cell in cells[1:]]
+        values = [value for value in values if value]
+        if values:
+            specs[label] = " | ".join(dict.fromkeys(values))
+    return specs
+
+
+def get_spec_value(specs, *labels):
+    """Return the first available specification value for any candidate label."""
+    for label in labels:
+        value = specs.get(label.lower())
+        if value:
+            return value
+    return None
+
+
+def simplify_cpu_value(cpu_value):
+    """Trim overly verbose processor strings when Lenovo includes a short model in parentheses."""
+    if not cpu_value:
+        return None
+    match = re.search(r"\(([^()]+)\)\s*$", cpu_value)
+    if match:
+        return match.group(1)
+    return cpu_value
+
+
 def normalize_warranty_date(date_value):
     """Return a validated warranty date string or None when Lenovo returns malformed data."""
     if not isinstance(date_value, str):
@@ -183,6 +341,325 @@ def normalize_warranty_date(date_value):
     except ValueError:
         return None
     return date_value
+
+
+def extract_newthink_warranty_values(raw):
+    """Extract normalized warranty start/end dates from a newthink warranty payload."""
+    start_date = None
+    end_date = None
+    issue = None
+    if not raw:
+        return {
+            "start_date": None,
+            "end_date": None,
+            "issue": None,
+        }
+
+    try:
+        detail_data = raw.get('detail_data') or {}
+        warranty_data = detail_data.get('onsite_data') or detail_data.get('warranty_data') or []
+
+        for warranty in warranty_data:
+            candidate_start = warranty.get('start_date')
+            candidate_end = warranty.get('end_date')
+            if candidate_start:
+                normalized_start = normalize_warranty_date(candidate_start)
+                if normalized_start:
+                    start_date = (
+                        compare_date(start_date, normalized_start, 'start')
+                        if start_date else normalized_start
+                    )
+                else:
+                    issue = append_issue(issue, f"Invalid warranty start date: {candidate_start}")
+            if candidate_end:
+                normalized_end = normalize_warranty_date(candidate_end)
+                if normalized_end:
+                    end_date = (
+                        compare_date(end_date, normalized_end, 'end')
+                        if end_date else normalized_end
+                    )
+                else:
+                    issue = append_issue(issue, f"Invalid warranty end date: {candidate_end}")
+    except Exception as e:
+        issue = append_issue(issue, f"Warranty processing error: {e}")
+
+    return {
+        "start_date": start_date,
+        "end_date": end_date,
+        "issue": issue,
+    }
+
+
+def get_newthink_machine_values(machine_info):
+    """Extract normalized model and MTM values from newthink machine info."""
+    machine_info = machine_info or {}
+    return {
+        "model": machine_info.get('product_model'),
+        "mtm": machine_info.get('machine_mtm'),
+    }
+
+
+def get_newthink_config_values(config_info):
+    """Extract normalized CPU/RAM/Disk values from newthink config info."""
+    config_info = config_info or []
+    return {
+        "cpu": get_config_value(config_info, 'CPU型号'),
+        "ram_factory": get_config_value(config_info, '内存容量'),
+        "disk_factory": get_config_value(config_info, '硬盘容量'),
+    }
+
+
+def refresh_primary_values(data):
+    """Populate output fields from already-fetched newthink payloads."""
+    merge_record_values(data, get_newthink_machine_values(data.get('machine_info')))
+    merge_record_values(data, get_newthink_config_values(data.get('config_info')))
+    warranty_values = extract_newthink_warranty_values(data.get('raw'))
+    merge_record_values(
+        data,
+        {
+            "start_date": warranty_values["start_date"],
+            "end_date": warranty_values["end_date"],
+        },
+    )
+    if warranty_values["issue"]:
+        data['warranty_issue'] = append_issue(data.get('warranty_issue'), warranty_values["issue"])
+
+
+def finalize_combined_group(data, field_names, state_field, issue_field, label):
+    """Resolve the final group state after primary and supplemental lookups."""
+    assessed_state, assessed_issue = assess_group_fields(data, field_names, label)
+    current_state = data.get(state_field, 'pending')
+    current_issue = data.get(issue_field)
+    backup_state = data.get('pcsupport_state', 'pending')
+    backup_issue = data.get('pcsupport_issue')
+
+    if assessed_state == 'success':
+        data[state_field] = 'success'
+        data[issue_field] = None
+        return
+
+    if assessed_state == 'partial':
+        data[state_field] = 'partial'
+        final_issue = assessed_issue
+        if current_state == 'error' and current_issue:
+            final_issue = append_issue(final_issue, current_issue)
+        if backup_state == 'error' and backup_issue:
+            final_issue = append_issue(final_issue, f"{label} lookup error: {backup_issue}")
+        data[issue_field] = final_issue
+        return
+
+    if current_state == 'error' or backup_state == 'error':
+        data[state_field] = 'error'
+        final_issue = current_issue
+        if backup_state == 'error' and backup_issue:
+            final_issue = append_issue(final_issue, f"{label} lookup error: {backup_issue}")
+        data[issue_field] = final_issue or f"{label} lookup error"
+        return
+
+    data[state_field] = 'not_found'
+    data[issue_field] = assessed_issue
+
+
+def get_pcsupport_machine_type(product_record):
+    """Extract machine type from the Lenovo PC Support product id path."""
+    product_id = product_record.get("Id", "")
+    parts = product_id.split("/")
+    if len(parts) >= 3:
+        return parts[-3]
+    return None
+
+
+def get_pcsupport_mtm(product_record, machine_info):
+    """Extract MTM from Lenovo PC Support data."""
+    if machine_info.get("product"):
+        return machine_info["product"]
+    product_id = product_record.get("Id", "")
+    parts = product_id.split("/")
+    if len(parts) >= 2:
+        return parts[-2]
+    return None
+
+
+def get_pcsupport_warranty_period(ibase_data):
+    """Return the earliest start and latest end across Lenovo PC Support base warranties."""
+    start_date = None
+    end_date = None
+    base_warranties = ibase_data.get("baseWarranties") or []
+    if not base_warranties and ibase_data.get("currentWarranty"):
+        base_warranties = [ibase_data["currentWarranty"]]
+
+    for warranty in base_warranties:
+        candidate_start = normalize_warranty_date(warranty.get("startDate"))
+        candidate_end = normalize_warranty_date(warranty.get("endDate"))
+        if candidate_start:
+            start_date = (
+                compare_date(start_date, candidate_start, "start")
+                if start_date else candidate_start
+            )
+        if candidate_end:
+            end_date = (
+                compare_date(end_date, candidate_end, "end")
+                if end_date else candidate_end
+            )
+
+    return start_date, end_date
+
+
+def get_pcsupport_device_info(sn):
+    """Return normalized warranty/device data from Lenovo PC Support."""
+    products = get_pcsupport_products(sn)
+    if not products:
+        return {
+            "state": "not_found",
+            "issue": "No matching serial was found",
+            "values": {},
+        }
+
+    product_record = products[0]
+    machine_type = get_pcsupport_machine_type(product_record)
+    if not machine_type:
+        return {
+            "state": "error",
+            "issue": "Machine type was missing in the supplemental lookup response",
+            "values": {},
+        }
+
+    ibase_response = get_pcsupport_ibase_info(sn, machine_type)
+    if ibase_response.get("code") != 0 or not ibase_response.get("data"):
+        description = ibase_response.get("msg", {}).get("desc") or "No information was found"
+        response_state = "not_found" if message_indicates_not_found(description) else "error"
+        return {
+            "state": response_state,
+            "issue": description,
+            "values": {},
+        }
+
+    ibase_data = ibase_response["data"]
+    machine_info = ibase_data.get("machineInfo") or {}
+    specs = parse_specification_table(machine_info.get("specification"))
+    start_date, end_date = get_pcsupport_warranty_period(ibase_data)
+    values = {
+        "model": machine_info.get("productName") or product_record.get("Name"),
+        "mtm": get_pcsupport_mtm(product_record, machine_info),
+        "start_date": start_date,
+        "end_date": end_date,
+        "cpu": simplify_cpu_value(get_spec_value(specs, "Processor", "CPU")),
+        "ram_factory": get_spec_value(specs, "Memory", "RAM", "DRAM"),
+        "disk_factory": get_spec_value(specs, "Hard Drive", "Storage", "Drive", "Disk"),
+    }
+
+    return {
+        "state": "success" if any(values.values()) else "empty",
+        "issue": None if any(values.values()) else "No supplemental device data was returned",
+        "values": values,
+    }
+
+
+def needs_warranty_lookup(data):
+    """Return True when warranty start/end are still incomplete."""
+    return not all(data.get(field) for field in ('start_date', 'end_date'))
+
+
+def needs_machine_lookup(data):
+    """Return True when model/MTM are still incomplete."""
+    return not all(data.get(field) for field in ('model', 'mtm'))
+
+
+def needs_config_lookup(data):
+    """Return True when CPU/RAM/Disk are still incomplete."""
+    return not all(data.get(field) for field in ('cpu', 'ram_factory', 'disk_factory'))
+
+
+def apply_newthink_warranty_response(data, warranty_response):
+    """Store primary warranty response data and populate normalized date fields."""
+    data['raw_fetched'] = True
+    status_code = warranty_response.get('statusCode')
+    message = warranty_response.get('message', {}).get('info')
+
+    if status_code != 200:
+        data['raw'] = None
+        if message_indicates_not_found(message):
+            data['warranty_state'] = 'not_found'
+            data['warranty_issue'] = "Warranty data not found"
+        else:
+            data['warranty_state'] = 'error'
+            data['warranty_issue'] = f"Warranty lookup returned status {status_code}: {message or 'unknown error'}"
+        return
+
+    raw = warranty_response.get('data')
+    data['raw'] = raw
+    if not raw:
+        data['warranty_state'] = 'not_found'
+        data['warranty_issue'] = "Warranty data not found"
+        return
+
+    warranty_values = extract_newthink_warranty_values(raw)
+    merge_record_values(
+        data,
+        {
+            'start_date': warranty_values['start_date'],
+            'end_date': warranty_values['end_date'],
+        },
+    )
+    assessed_state, assessed_issue = assess_group_fields(data, ('start_date', 'end_date'), 'Warranty')
+    data['warranty_state'] = assessed_state
+    data['warranty_issue'] = append_issue(assessed_issue, warranty_values['issue'])
+
+
+def apply_newthink_machine_info_response(data, machine_response):
+    """Store primary machine info response data and populate normalized model/MTM fields."""
+    data['machine_info_fetched'] = True
+    status_code = machine_response.get('statusCode')
+    message = machine_response.get('message', {}).get('info')
+
+    if status_code != 200:
+        data['machine_info'] = {}
+        if message_indicates_not_found(message):
+            data['machine_info_state'] = 'not_found'
+            data['machine_info_issue'] = "Model/MTM data not found"
+        else:
+            data['machine_info_state'] = 'error'
+            data['machine_info_issue'] = (
+                f"Model/MTM lookup returned status {status_code}: {message or 'unknown error'}"
+            )
+        return
+
+    machine_info = machine_response.get('data', {}).get('data') or {}
+    data['machine_info'] = machine_info
+    merge_record_values(data, get_newthink_machine_values(machine_info))
+    assessed_state, assessed_issue = assess_group_fields(data, ('model', 'mtm'), 'Model/MTM')
+    data['machine_info_state'] = assessed_state
+    data['machine_info_issue'] = assessed_issue
+
+
+def apply_newthink_config_response(data, config_response):
+    """Store primary config response data and populate normalized CPU/RAM/Disk fields."""
+    data['config_info_fetched'] = True
+    status_code = config_response.get('statusCode')
+    message = config_response.get('message', {}).get('info')
+
+    if status_code != 200:
+        data['config_info'] = []
+        if message_indicates_not_found(message):
+            data['config_info_state'] = 'not_found'
+            data['config_info_issue'] = "Configuration data not found"
+        else:
+            data['config_info_state'] = 'error'
+            data['config_info_issue'] = (
+                f"Configuration lookup returned status {status_code}: {message or 'unknown error'}"
+            )
+        return
+
+    config_info = config_response.get('data') or []
+    data['config_info'] = config_info
+    merge_record_values(data, get_newthink_config_values(config_info))
+    assessed_state, assessed_issue = assess_group_fields(
+        data,
+        ('cpu', 'ram_factory', 'disk_factory'),
+        'Configuration',
+    )
+    data['config_info_state'] = assessed_state
+    data['config_info_issue'] = assessed_issue
 
 
 def compare_date(d1, d2, order):
@@ -220,6 +697,10 @@ class LenovoWarranty():
                 if sn and sn not in self.collection:
                     validation_error = validate_serial_number(sn)
                     self.collection[sn] = {
+                        'pcsupport_fetched': bool(validation_error),
+                        'pcsupport_state': 'invalid_input' if validation_error else 'pending',
+                        'pcsupport_issue': None,
+                        'backup_used': False,
                         'raw_fetched': bool(validation_error),
                         'machine_info_fetched': bool(validation_error),
                         'config_info_fetched': bool(validation_error),
@@ -233,10 +714,16 @@ class LenovoWarranty():
                     }
 
     def fetch_warranty(self):
-        """Fetch warranty and device metadata, then update collection."""
+        """Fetch newthink data first, then use Lenovo PC Support to fill remaining gaps."""
         succeed = 0
-        total = 0
-        for sn, data in self.collection.items():
+        total = len(self.collection)
+        for index, (sn, data) in enumerate(self.collection.items(), start=1):
+            logging.info(f"[{index}/{total}] {sn}: starting lookup")
+
+            data.setdefault('pcsupport_fetched', False)
+            data.setdefault('pcsupport_state', 'pending')
+            data.setdefault('pcsupport_issue', None)
+            data.setdefault('backup_used', False)
             data.setdefault('raw_fetched', 'raw' in data)
             data.setdefault('machine_info_fetched', 'machine_info' in data)
             data.setdefault('config_info_fetched', 'config_info' in data)
@@ -249,184 +736,110 @@ class LenovoWarranty():
             data.setdefault('config_info_issue', None)
 
             if data.get('validation_error'):
-                logging.info(f"Skipping Lenovo queries for {sn}: {data['validation_error']}")
+                logging.warning(f"[{index}/{total}] {sn}: {data['validation_error']}")
                 continue
 
-            # skip if required raw data for the sn already exists
-            if (
-                data['raw_fetched']
-                and data['machine_info_fetched']
-                and data['config_info_fetched']
-            ):
-                continue
+            refresh_primary_values(data)
 
-            total += 1
-
-            if not data['raw_fetched']:
+            if needs_warranty_lookup(data) and not data['raw_fetched']:
                 try:
                     warranty_response = get_warranty(sn)
                 except Exception as e:
                     data['warranty_state'] = 'error'
-                    data['warranty_issue'] = f"Warranty API error: {e}"
-                    logging.info(f"Error while retrieving warranty data for {sn}: {e}")
+                    data['warranty_issue'] = f"Warranty lookup error: {e}"
+                    logging.info(f"[{index}/{total}] {sn}: newthink warranty error: {e}")
                 else:
-                    data['raw_fetched'] = True
-                    if warranty_response['statusCode'] != 200:
-                        message = warranty_response.get('message', {}).get('info')
-                        data['warranty_state'] = 'not_found'
-                        data['warranty_issue'] = (
-                            f"Warranty API returned status {warranty_response['statusCode']}: {message}"
-                        )
-                        data['raw'] = None
-                        logging.info(
-                            f"Warranty API returned status {warranty_response['statusCode']} for {sn}: {message}"
-                        )
-                    else:
-                        raw = warranty_response.get('data')
-                        data['raw'] = raw
-                        if raw:
-                            data['warranty_state'] = 'success'
-                            data['warranty_issue'] = None
-                        else:
-                            data['warranty_state'] = 'empty'
-                            data['warranty_issue'] = "Warranty API returned no usable data"
-                            logging.info(f"No warranty data returned for SN: {sn}")
+                    apply_newthink_warranty_response(data, warranty_response)
+                    if data['warranty_state'] == 'success':
+                        logging.info(f"[{index}/{total}] {sn}: newthink warranty data loaded")
 
-            if not data['machine_info_fetched']:
+            if needs_machine_lookup(data) and not data['machine_info_fetched']:
                 try:
                     machine_response = get_machine_info(sn)
                 except Exception as e:
                     data['machine_info_state'] = 'error'
-                    data['machine_info_issue'] = f"Machine info API error: {e}"
-                    logging.info(f"Error while retrieving machine info for {sn}: {e}")
+                    data['machine_info_issue'] = f"Model/MTM lookup error: {e}"
+                    logging.info(f"[{index}/{total}] {sn}: newthink machine info error: {e}")
                 else:
-                    data['machine_info_fetched'] = True
-                    if machine_response['statusCode'] != 200:
-                        message = machine_response.get('message', {}).get('info')
-                        data['machine_info_state'] = 'not_found'
-                        data['machine_info_issue'] = (
-                            f"Machine info API returned status {machine_response['statusCode']}: {message}"
-                        )
-                        data['machine_info'] = {}
-                        logging.info(
-                            f"Machine info API returned status {machine_response['statusCode']} for {sn}: {message}"
-                        )
-                    else:
-                        machine_info = machine_response.get('data', {}).get('data')
-                        data['machine_info'] = machine_info or {}
-                        if machine_info:
-                            data['machine_info_state'] = 'success'
-                            data['machine_info_issue'] = None
-                        else:
-                            data['machine_info_state'] = 'empty'
-                            data['machine_info_issue'] = "Machine info API returned no usable data"
-                            logging.info(f"No machine info returned for SN: {sn}")
+                    apply_newthink_machine_info_response(data, machine_response)
+                    if data['machine_info_state'] == 'success':
+                        logging.info(f"[{index}/{total}] {sn}: newthink model/mtm data loaded")
 
-            if not data['config_info_fetched']:
+            if needs_config_lookup(data) and not data['config_info_fetched']:
                 try:
                     config_response = get_config_info(sn)
                 except Exception as e:
                     data['config_info_state'] = 'error'
-                    data['config_info_issue'] = f"Config info API error: {e}"
-                    logging.info(f"Error while retrieving config info for {sn}: {e}")
+                    data['config_info_issue'] = f"Configuration lookup error: {e}"
+                    logging.info(f"[{index}/{total}] {sn}: newthink config info error: {e}")
                 else:
-                    data['config_info_fetched'] = True
-                    if config_response['statusCode'] != 200:
-                        message = config_response.get('message', {}).get('info')
-                        data['config_info_state'] = 'not_found'
-                        data['config_info_issue'] = (
-                            f"Config info API returned status {config_response['statusCode']}: {message}"
-                        )
-                        data['config_info'] = []
-                        logging.info(
-                            f"Config info API returned status {config_response['statusCode']} for {sn}: {message}"
-                        )
-                    else:
-                        config_info = config_response.get('data') or []
-                        data['config_info'] = config_info
-                        if config_info:
-                            data['config_info_state'] = 'success'
-                            data['config_info_issue'] = None
-                        else:
-                            data['config_info_state'] = 'empty'
-                            data['config_info_issue'] = "Config info API returned no usable data"
-                            logging.info(f"No config info returned for SN: {sn}")
+                    apply_newthink_config_response(data, config_response)
+                    if data['config_info_state'] == 'success':
+                        logging.info(f"[{index}/{total}] {sn}: newthink configuration data loaded")
 
-            if data.get('raw') and data.get('machine_info') and data.get('config_info'):
+            refresh_primary_values(data)
+
+            if not data['pcsupport_fetched'] and not is_complete_record(data):
+                if not data.get('backup_used'):
+                    reason = '; '.join(
+                        note
+                        for note in (
+                            data.get('warranty_issue'),
+                            data.get('machine_info_issue'),
+                            data.get('config_info_issue'),
+                        )
+                        if note
+                    ) or 'primary lookup returned incomplete data'
+                    logging.warning(f"[{index}/{total}] {sn}: using pcsupport backup ({reason})")
+                data['backup_used'] = True
+
+                try:
+                    pcsupport_result = get_pcsupport_device_info(sn)
+                except Exception as e:
+                    data['pcsupport_state'] = 'error'
+                    data['pcsupport_issue'] = str(e)
+                    logging.info(f"[{index}/{total}] {sn}: pcsupport backup error: {e}")
+                else:
+                    data['pcsupport_fetched'] = pcsupport_result['state'] != 'error'
+                    data['pcsupport_state'] = pcsupport_result['state']
+                    data['pcsupport_issue'] = pcsupport_result['issue']
+                    merge_record_values(data, pcsupport_result['values'])
+                    if pcsupport_result['state'] == 'success':
+                        logging.info(f"[{index}/{total}] {sn}: pcsupport backup returned supplemental data")
+
+            if is_complete_record(data):
                 succeed += 1
-                logging.info(f"SN warranty, machine info, and config fetched: {sn}")
-        logging.info(f"Fetched {total} SN in total, {succeed} succeed")
+                logging.info(f"[{index}/{total}] {sn}: collected complete data")
+            else:
+                logging.info(f"[{index}/{total}] {sn}: provider fetches complete; final status pending")
+        logging.info(f"Lookup phase complete: {succeed}/{total} serials currently have complete data")
 
     def process_warranty(self):
-        """
-        Process using raw data already have.
-        
-        TODO: there are a lot of different kinds of warranty, find the most accurate way
-        """
-        for sn, data in self.collection.items():
-            # get warranty start and end date
-            start_date = None
-            end_date = None
+        """Finalize output fields and aggregate status after all lookup attempts."""
+        total = len(self.collection)
+        for index, (sn, data) in enumerate(self.collection.items(), start=1):
+            if data.get('validation_error'):
+                self.collection[sn]['query_status'] = get_query_status(self.collection[sn])
+                self.collection[sn]['notes'] = build_notes(self.collection[sn])
+                logging.info(
+                    f"[{index}/{total}] {sn}: final status {self.collection[sn]['query_status']}"
+                )
+                continue
 
-            if data.get('raw'):
-                try:
-                    # some SN has empty onsite_date
-                    detail_data = data['raw']['detail_data']
-                    if detail_data['onsite_data']:
-                        warranty_data = detail_data['onsite_data']
-                    else:
-                        warranty_data = detail_data['warranty_data']
-
-                    for w in warranty_data:
-                        _start = w.get('start_date')
-                        _end = w.get('end_date')
-                        if _start:
-                            normalized_start = normalize_warranty_date(_start)
-                            if normalized_start:
-                                start_date = (
-                                    compare_date(start_date, normalized_start, 'start')
-                                    if start_date else normalized_start
-                                )
-                            else:
-                                self.collection[sn]['warranty_issue'] = append_issue(
-                                    self.collection[sn].get('warranty_issue'),
-                                    f"Invalid warranty start date: {_start}",
-                                )
-                        if _end:
-                            normalized_end = normalize_warranty_date(_end)
-                            if normalized_end:
-                                end_date = (
-                                    compare_date(end_date, normalized_end, 'end')
-                                    if end_date else normalized_end
-                                )
-                            else:
-                                self.collection[sn]['warranty_issue'] = append_issue(
-                                    self.collection[sn].get('warranty_issue'),
-                                    f"Invalid warranty end date: {_end}",
-                                )
-                except Exception as e:
-                    self.collection[sn]['warranty_issue'] = append_issue(
-                        self.collection[sn].get('warranty_issue'),
-                        f"Warranty processing error: {e}",
-                    )
-                    logging.info(f"Error during process start and end date for {sn}: {e}")
-            else:
-                logging.info(f"No warranty data available to process for SN: {sn}")
-
-            self.collection[sn]['start_date'] = start_date
-            self.collection[sn]['end_date'] = end_date
-            self.collection[sn]['model'] = data.get('machine_info', {}).get('product_model')
-            self.collection[sn]['mtm'] = data.get('machine_info', {}).get('machine_mtm')
-            self.collection[sn]['cpu'] = get_config_value(data.get('config_info'), 'CPU型号')
-            self.collection[sn]['ram_factory'] = get_config_value(data.get('config_info'), '内存容量')
-            self.collection[sn]['disk_factory'] = get_config_value(data.get('config_info'), '硬盘容量')
+            refresh_primary_values(self.collection[sn])
+            finalize_combined_group(self.collection[sn], ('start_date', 'end_date'), 'warranty_state', 'warranty_issue', 'Warranty')
+            finalize_combined_group(self.collection[sn], ('model', 'mtm'), 'machine_info_state', 'machine_info_issue', 'Model/MTM')
+            finalize_combined_group(
+                self.collection[sn],
+                ('cpu', 'ram_factory', 'disk_factory'),
+                'config_info_state',
+                'config_info_issue',
+                'Configuration',
+            )
             self.collection[sn]['query_status'] = get_query_status(self.collection[sn])
             self.collection[sn]['notes'] = build_notes(self.collection[sn])
             logging.info(
-                f"Processed: {sn}, {self.collection[sn]['model']}, {start_date}, {end_date}, "
-                f"{self.collection[sn]['mtm']}, {self.collection[sn]['cpu']}, "
-                f"{self.collection[sn]['ram_factory']}, {self.collection[sn]['disk_factory']}, "
-                f"{self.collection[sn]['query_status']}, {self.collection[sn]['notes']}"
+                f"[{index}/{total}] {sn}: final status {self.collection[sn]['query_status']}"
             )
 
     def add(self, sn_file = None):
@@ -436,11 +849,24 @@ class LenovoWarranty():
         """
         if sn_file:
             self.update_collection(sn_file)
+            logging.info(f"Loaded {len(self.collection)} unique normalized serial numbers")
         self.fetch_warranty()
         self.process_warranty()
         self.status()
 
     def status(self):
+        counts = self.get_status_counts()
+        logging.info(
+            "SN query status: "
+            f"OK={counts[QUERY_STATUS_OK]}, "
+            f"PARTIAL={counts[QUERY_STATUS_PARTIAL]}, "
+            f"NOT_FOUND={counts[QUERY_STATUS_NOT_FOUND]}, "
+            f"INVALID_INPUT={counts[QUERY_STATUS_INVALID_INPUT]}, "
+            f"API_ERROR={counts[QUERY_STATUS_API_ERROR]}"
+        )
+        return counts
+
+    def get_status_counts(self):
         counts = {
             QUERY_STATUS_OK: 0,
             QUERY_STATUS_PARTIAL: 0,
@@ -450,14 +876,7 @@ class LenovoWarranty():
         }
         for _, data in self.collection.items():
             counts[get_query_status(data)] += 1
-        logging.info(
-            "SN query status: "
-            f"OK={counts[QUERY_STATUS_OK]}, "
-            f"PARTIAL={counts[QUERY_STATUS_PARTIAL]}, "
-            f"NOT_FOUND={counts[QUERY_STATUS_NOT_FOUND]}, "
-            f"INVALID_INPUT={counts[QUERY_STATUS_INVALID_INPUT]}, "
-            f"API_ERROR={counts[QUERY_STATUS_API_ERROR]}"
-        )
+        return counts
 
     def save(self, file = "lenovo_warranty.csv"):
         """Save warranty data to CSV file"""
@@ -482,6 +901,19 @@ class LenovoWarranty():
             writer.writerows(data)
 
         logging.info(f"Saved warranty data to CSV file '{file}'")
+        counts = self.get_status_counts()
+        backup_used = sum(1 for warranty in self.collection.values() if warranty.get('backup_used'))
+        logging.info(
+            "Final summary: "
+            f"total={len(self.collection)}, "
+            f"OK={counts[QUERY_STATUS_OK]}, "
+            f"PARTIAL={counts[QUERY_STATUS_PARTIAL]}, "
+            f"NOT_FOUND={counts[QUERY_STATUS_NOT_FOUND]}, "
+            f"INVALID_INPUT={counts[QUERY_STATUS_INVALID_INPUT]}, "
+            f"API_ERROR={counts[QUERY_STATUS_API_ERROR]}, "
+            f"backup_used={backup_used}, "
+            f"output='{file}'"
+        )
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Fetch Lenovo warranty information and export it to CSV.")
@@ -492,6 +924,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     # running
+    configure_logging()
     warranty = LenovoWarranty()
     warranty.add(args.sn)
     warranty.save(args.csv)

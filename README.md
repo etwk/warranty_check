@@ -20,8 +20,14 @@ normalize to the same SN produce a single CSV row. Missing values are exported
 as `N/A`, and `Query Status`/`Notes` explain invalid input, partial results,
 not-found responses, or API errors.
 
+The script now queries `newthink.lenovo.com.cn` as the primary source and falls
+back to `pcsupport.lenovo.com` when the primary source does not return all
+required data. Fallback usage is logged as a warning in the terminal.
+
 Transient Lenovo API/network failures are retried automatically before a row is
-marked with an API error.
+marked with an API error. When the script runs from the terminal it emits
+real-time INFO/WARNING logging so progress is visible while SNs are processed,
+followed by a final summary line after the CSV is written.
 
 ## How-to
 ### Use the script
