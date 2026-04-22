@@ -11,8 +11,17 @@ Current CSV columns:
   - CPU
   - RAM (Factory)
   - Disk (Factory)
+  - Query Status
+  - Notes
 
-Rows are exported only when all CSV columns above have values.
+Each unique normalized SN is kept in the CSV. Input values are normalized by
+trimming spaces, removing hyphens, and uppercasing; duplicate lines that
+normalize to the same SN produce a single CSV row. Missing values are exported
+as `N/A`, and `Query Status`/`Notes` explain invalid input, partial results,
+not-found responses, or API errors.
+
+Transient Lenovo API/network failures are retried automatically before a row is
+marked with an API error.
 
 ## How-to
 ### Use the script
