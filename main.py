@@ -206,6 +206,17 @@ def append_issue(existing_issue, new_issue):
     return f"{existing_issue}; {new_issue}"
 
 
+def combine_issues(*issues):
+    """Combine one or more semicolon-delimited issue strings without duplicates."""
+    combined_issue = None
+    for issue in issues:
+        if not issue:
+            continue
+        for part in issue.split('; '):
+            combined_issue = append_issue(combined_issue, part)
+    return combined_issue
+
+
 def merge_record_values(data, values):
     """Fill output fields only when they are currently missing."""
     for key, value in values.items():
@@ -246,7 +257,9 @@ def build_notes(warranty):
         warranty.get('machine_info_issue'),
         warranty.get('config_info_issue'),
     ]
-    return '; '.join(note for note in notes if note)
+    if warranty.get('backup_used'):
+        notes.append("Used secondary API (pcsupport)")
+    return combine_issues(*notes) or ""
 
 
 def get_query_status(warranty):
@@ -440,19 +453,20 @@ def finalize_combined_group(data, field_names, state_field, issue_field, label):
 
     if assessed_state == 'partial':
         data[state_field] = 'partial'
-        final_issue = assessed_issue
-        if current_state == 'error' and current_issue:
-            final_issue = append_issue(final_issue, current_issue)
-        if backup_state == 'error' and backup_issue:
-            final_issue = append_issue(final_issue, f"{label} lookup error: {backup_issue}")
+        final_issue = combine_issues(
+            assessed_issue,
+            current_issue if current_state in {'partial', 'error'} else None,
+            f"{label} lookup error: {backup_issue}" if backup_state == 'error' and backup_issue else None,
+        )
         data[issue_field] = final_issue
         return
 
     if current_state == 'error' or backup_state == 'error':
         data[state_field] = 'error'
-        final_issue = current_issue
-        if backup_state == 'error' and backup_issue:
-            final_issue = append_issue(final_issue, f"{label} lookup error: {backup_issue}")
+        final_issue = combine_issues(
+            current_issue,
+            f"{label} lookup error: {backup_issue}" if backup_state == 'error' and backup_issue else None,
+        )
         data[issue_field] = final_issue or f"{label} lookup error"
         return
 
@@ -682,6 +696,79 @@ def compare_date(d1, d2, order):
         else:
             choose = d1
     return choose
+
+
+def initialize_record_defaults(data):
+    """Populate all expected record keys so one serial can be processed end-to-end."""
+    data.setdefault('pcsupport_fetched', False)
+    data.setdefault('pcsupport_state', 'pending')
+    data.setdefault('pcsupport_issue', None)
+    data.setdefault('backup_used', False)
+    data.setdefault('raw_fetched', 'raw' in data)
+    data.setdefault('machine_info_fetched', 'machine_info' in data)
+    data.setdefault('config_info_fetched', 'config_info' in data)
+    data.setdefault('warranty_state', 'success' if data.get('raw') else 'pending')
+    data.setdefault('machine_info_state', 'success' if data.get('machine_info') else 'pending')
+    data.setdefault('config_info_state', 'success' if data.get('config_info') else 'pending')
+    data.setdefault('validation_error', None)
+    data.setdefault('warranty_issue', None)
+    data.setdefault('machine_info_issue', None)
+    data.setdefault('config_info_issue', None)
+
+
+def finalize_record(data):
+    """Finalize one serial number record after all lookup attempts."""
+    if data.get('validation_error'):
+        data['query_status'] = get_query_status(data)
+        data['notes'] = build_notes(data)
+        return
+
+    refresh_primary_values(data)
+    finalize_combined_group(data, ('start_date', 'end_date'), 'warranty_state', 'warranty_issue', 'Warranty')
+    finalize_combined_group(data, ('model', 'mtm'), 'machine_info_state', 'machine_info_issue', 'Model/MTM')
+    finalize_combined_group(
+        data,
+        ('cpu', 'ram_factory', 'disk_factory'),
+        'config_info_state',
+        'config_info_issue',
+        'Configuration',
+    )
+    data['query_status'] = get_query_status(data)
+    data['notes'] = build_notes(data)
+
+
+def get_record_log_level(data):
+    """Choose the log level for a per-serial summary line."""
+    status = data.get('query_status') or get_query_status(data)
+    if status == QUERY_STATUS_API_ERROR:
+        return logging.ERROR
+    if status in {QUERY_STATUS_INVALID_INPUT, QUERY_STATUS_PARTIAL} or data.get('backup_used'):
+        return logging.WARNING
+    return logging.INFO
+
+
+def log_record_summary(index, total, sn, data):
+    """Emit one summary line for the serial number unless retries emitted extra logs."""
+    status = data.get('query_status') or get_query_status(data)
+    parts = [
+        f"[{index}/{total}] {sn}",
+        f"status={status}",
+        f"backup={'Y' if data.get('backup_used') else 'N'}",
+    ]
+
+    if data.get('model'):
+        parts.append(f"model={data['model']}")
+    if data.get('mtm'):
+        parts.append(f"mtm={data['mtm']}")
+    if data.get('start_date') or data.get('end_date'):
+        parts.append(
+            "warranty="
+            f"{to_csv_value(data.get('start_date'))}->{to_csv_value(data.get('end_date'))}"
+        )
+    if data.get('notes') and (status != QUERY_STATUS_OK or data.get('backup_used')):
+        parts.append(f"notes={data['notes']}")
+
+    logging.log(get_record_log_level(data), " | ".join(parts))
     
 class LenovoWarranty():
     def __init__(self, sn_file = None):
@@ -715,28 +802,13 @@ class LenovoWarranty():
 
     def fetch_warranty(self):
         """Fetch newthink data first, then use Lenovo PC Support to fill remaining gaps."""
-        succeed = 0
         total = len(self.collection)
         for index, (sn, data) in enumerate(self.collection.items(), start=1):
-            logging.info(f"[{index}/{total}] {sn}: starting lookup")
-
-            data.setdefault('pcsupport_fetched', False)
-            data.setdefault('pcsupport_state', 'pending')
-            data.setdefault('pcsupport_issue', None)
-            data.setdefault('backup_used', False)
-            data.setdefault('raw_fetched', 'raw' in data)
-            data.setdefault('machine_info_fetched', 'machine_info' in data)
-            data.setdefault('config_info_fetched', 'config_info' in data)
-            data.setdefault('warranty_state', 'success' if data.get('raw') else 'pending')
-            data.setdefault('machine_info_state', 'success' if data.get('machine_info') else 'pending')
-            data.setdefault('config_info_state', 'success' if data.get('config_info') else 'pending')
-            data.setdefault('validation_error', None)
-            data.setdefault('warranty_issue', None)
-            data.setdefault('machine_info_issue', None)
-            data.setdefault('config_info_issue', None)
+            initialize_record_defaults(data)
 
             if data.get('validation_error'):
-                logging.warning(f"[{index}/{total}] {sn}: {data['validation_error']}")
+                finalize_record(data)
+                log_record_summary(index, total, sn, data)
                 continue
 
             refresh_primary_values(data)
@@ -747,11 +819,8 @@ class LenovoWarranty():
                 except Exception as e:
                     data['warranty_state'] = 'error'
                     data['warranty_issue'] = f"Warranty lookup error: {e}"
-                    logging.info(f"[{index}/{total}] {sn}: newthink warranty error: {e}")
                 else:
                     apply_newthink_warranty_response(data, warranty_response)
-                    if data['warranty_state'] == 'success':
-                        logging.info(f"[{index}/{total}] {sn}: newthink warranty data loaded")
 
             if needs_machine_lookup(data) and not data['machine_info_fetched']:
                 try:
@@ -759,11 +828,8 @@ class LenovoWarranty():
                 except Exception as e:
                     data['machine_info_state'] = 'error'
                     data['machine_info_issue'] = f"Model/MTM lookup error: {e}"
-                    logging.info(f"[{index}/{total}] {sn}: newthink machine info error: {e}")
                 else:
                     apply_newthink_machine_info_response(data, machine_response)
-                    if data['machine_info_state'] == 'success':
-                        logging.info(f"[{index}/{total}] {sn}: newthink model/mtm data loaded")
 
             if needs_config_lookup(data) and not data['config_info_fetched']:
                 try:
@@ -771,26 +837,12 @@ class LenovoWarranty():
                 except Exception as e:
                     data['config_info_state'] = 'error'
                     data['config_info_issue'] = f"Configuration lookup error: {e}"
-                    logging.info(f"[{index}/{total}] {sn}: newthink config info error: {e}")
                 else:
                     apply_newthink_config_response(data, config_response)
-                    if data['config_info_state'] == 'success':
-                        logging.info(f"[{index}/{total}] {sn}: newthink configuration data loaded")
 
             refresh_primary_values(data)
 
             if not data['pcsupport_fetched'] and not is_complete_record(data):
-                if not data.get('backup_used'):
-                    reason = '; '.join(
-                        note
-                        for note in (
-                            data.get('warranty_issue'),
-                            data.get('machine_info_issue'),
-                            data.get('config_info_issue'),
-                        )
-                        if note
-                    ) or 'primary lookup returned incomplete data'
-                    logging.warning(f"[{index}/{total}] {sn}: using pcsupport backup ({reason})")
                 data['backup_used'] = True
 
                 try:
@@ -798,49 +850,18 @@ class LenovoWarranty():
                 except Exception as e:
                     data['pcsupport_state'] = 'error'
                     data['pcsupport_issue'] = str(e)
-                    logging.info(f"[{index}/{total}] {sn}: pcsupport backup error: {e}")
                 else:
                     data['pcsupport_fetched'] = pcsupport_result['state'] != 'error'
                     data['pcsupport_state'] = pcsupport_result['state']
                     data['pcsupport_issue'] = pcsupport_result['issue']
                     merge_record_values(data, pcsupport_result['values'])
-                    if pcsupport_result['state'] == 'success':
-                        logging.info(f"[{index}/{total}] {sn}: pcsupport backup returned supplemental data")
-
-            if is_complete_record(data):
-                succeed += 1
-                logging.info(f"[{index}/{total}] {sn}: collected complete data")
-            else:
-                logging.info(f"[{index}/{total}] {sn}: provider fetches complete; final status pending")
-        logging.info(f"Lookup phase complete: {succeed}/{total} serials currently have complete data")
+            finalize_record(data)
+            log_record_summary(index, total, sn, data)
 
     def process_warranty(self):
         """Finalize output fields and aggregate status after all lookup attempts."""
-        total = len(self.collection)
-        for index, (sn, data) in enumerate(self.collection.items(), start=1):
-            if data.get('validation_error'):
-                self.collection[sn]['query_status'] = get_query_status(self.collection[sn])
-                self.collection[sn]['notes'] = build_notes(self.collection[sn])
-                logging.info(
-                    f"[{index}/{total}] {sn}: final status {self.collection[sn]['query_status']}"
-                )
-                continue
-
-            refresh_primary_values(self.collection[sn])
-            finalize_combined_group(self.collection[sn], ('start_date', 'end_date'), 'warranty_state', 'warranty_issue', 'Warranty')
-            finalize_combined_group(self.collection[sn], ('model', 'mtm'), 'machine_info_state', 'machine_info_issue', 'Model/MTM')
-            finalize_combined_group(
-                self.collection[sn],
-                ('cpu', 'ram_factory', 'disk_factory'),
-                'config_info_state',
-                'config_info_issue',
-                'Configuration',
-            )
-            self.collection[sn]['query_status'] = get_query_status(self.collection[sn])
-            self.collection[sn]['notes'] = build_notes(self.collection[sn])
-            logging.info(
-                f"[{index}/{total}] {sn}: final status {self.collection[sn]['query_status']}"
-            )
+        for _, data in self.collection.items():
+            finalize_record(data)
 
     def add(self, sn_file = None):
         """
@@ -851,7 +872,6 @@ class LenovoWarranty():
             self.update_collection(sn_file)
             logging.info(f"Loaded {len(self.collection)} unique normalized serial numbers")
         self.fetch_warranty()
-        self.process_warranty()
         self.status()
 
     def status(self):

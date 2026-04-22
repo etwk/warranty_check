@@ -22,12 +22,15 @@ not-found responses, or API errors.
 
 The script now queries `newthink.lenovo.com.cn` as the primary source and falls
 back to `pcsupport.lenovo.com` when the primary source does not return all
-required data. Fallback usage is logged as a warning in the terminal.
+required data. Fallback usage is logged as a warning in the terminal and is
+also written into the `Notes` column for that SN.
 
 Transient Lenovo API/network failures are retried automatically before a row is
 marked with an API error. When the script runs from the terminal it emits
-real-time INFO/WARNING logging so progress is visible while SNs are processed,
-followed by a final summary line after the CSV is written.
+real-time INFO/WARNING logging so progress is visible while SNs are processed;
+under normal conditions each SN is summarized on a single line, followed by
+aggregate status and final summary lines for the whole run after processing /
+CSV output.
 
 ## How-to
 ### Use the script
