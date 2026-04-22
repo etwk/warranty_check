@@ -2,6 +2,18 @@ Fetch warranty info and save to CSV.
 Supported vendor:
   - Lenovo: laptop
 
+Current CSV columns:
+  - Serial Number
+  - Model
+  - Warranty Start
+  - Warranty End
+  - MTM
+  - CPU
+  - RAM (Factory)
+  - Disk (Factory)
+
+Rows are exported only when all CSV columns above have values.
+
 ## How-to
 ### Use the script
 ```
